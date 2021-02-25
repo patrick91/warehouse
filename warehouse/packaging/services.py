@@ -20,7 +20,7 @@ import google.api_core.retry
 
 from zope.interface import implementer
 
-from warehouse.packaging.interfaces import IDocsStorage, IFileStorage
+from warehouse.packaging.interfaces import IDocsStorage, IFileStorage, ISimpleStorage
 
 
 class InsecureStorageWarning(UserWarning):
@@ -57,6 +57,37 @@ class LocalFileStorage:
             with open(file_path, "rb") as src_fp:
                 dest_fp.write(src_fp.read())
 
+
+@implementer(ISimpleStorage)
+class LocalSimpleStorage:
+    def __init__(self, base):
+        # This class should not be used in production, it's trivial for it to
+        # be used to read arbitrary files from the disk. It is intended ONLY
+        # for local development with trusted users. To make this clear, we'll
+        # raise a warning.
+        warnings.warn(
+            "LocalSimpleStorage is intended only for use in development, you "
+            "should not use it in production due to the lack of safe guards "
+            "for safely locating files on disk.",
+            InsecureStorageWarning,
+        )
+
+        self.base = base
+
+    @classmethod
+    def create_service(cls, context, request):
+        return cls(request.registry.settings["simple.path"])
+
+    def get(self, path):
+        return open(os.path.join(self.base, path), "rb")
+
+    def store(self, path, file_path, *, meta=None):
+        destination = os.path.join(self.base, path)
+        print(destination)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        with open(destination, "wb") as dest_fp:
+            with open(file_path, "rb") as src_fp:
+                dest_fp.write(src_fp.read())
 
 @implementer(IDocsStorage)
 class LocalDocsStorage:
@@ -137,6 +168,37 @@ class S3FileStorage(GenericFileStorage):
         self.bucket.upload_file(file_path, path, ExtraArgs=extra_args)
 
 
+@implementer(ISimpleStorage)
+class S3SimpleStorage(GenericFileStorage):
+    @classmethod
+    def create_service(cls, context, request):
+        session = request.find_service(name="aws.session")
+        s3 = session.resource("s3")
+        bucket = s3.Bucket(request.registry.settings["files.bucket"])
+        prefix = request.registry.settings.get("files.prefix")
+        return cls(bucket, prefix=prefix)
+
+    def get(self, path):
+        # Note: this is not actually used in production, instead our CDN is
+        # configured to connect directly to our storage bucket. See:
+        # https://github.com/python/pypi-infra/blob/master/terraform/file-hosting/vcl/main.vcl
+        try:
+            return self.bucket.Object(self._get_path(path)).get()["Body"]
+        except botocore.exceptions.ClientError as exc:
+            if exc.response["Error"]["Code"] != "NoSuchKey":
+                raise
+            raise FileNotFoundError("No such key: {!r}".format(path)) from None
+
+    def store(self, path, file_path, *, meta=None):
+        extra_args = {}
+        if meta is not None:
+            extra_args["Metadata"] = meta
+
+        path = self._get_path(path)
+
+        self.bucket.upload_file(file_path, path, ExtraArgs=extra_args)
+
+
 @implementer(IDocsStorage)
 class S3DocsStorage:
     def __init__(self, s3_client, bucket_name, *, prefix=None):
@@ -172,6 +234,41 @@ class S3DocsStorage:
 
 @implementer(IFileStorage)
 class GCSFileStorage(GenericFileStorage):
+    @classmethod
+    @google.api_core.retry.Retry(
+        predicate=google.api_core.retry.if_exception_type(
+            google.api_core.exceptions.ServiceUnavailable
+        )
+    )
+    def create_service(cls, context, request):
+        storage_client = request.find_service(name="gcloud.gcs")
+        bucket_name = request.registry.settings["files.bucket"]
+        bucket = storage_client.get_bucket(bucket_name)
+        prefix = request.registry.settings.get("files.prefix")
+
+        return cls(bucket, prefix=prefix)
+
+    def get(self, path):
+        # Note: this is not actually used in production, instead our CDN is
+        # configured to connect directly to our storage bucket. See:
+        # https://github.com/python/pypi-infra/blob/master/terraform/file-hosting/vcl/main.vcl
+        raise NotImplementedError
+
+    @google.api_core.retry.Retry(
+        predicate=google.api_core.retry.if_exception_type(
+            google.api_core.exceptions.ServiceUnavailable
+        )
+    )
+    def store(self, path, file_path, *, meta=None):
+        path = self._get_path(path)
+        blob = self.bucket.blob(path)
+        if meta is not None:
+            blob.metadata = meta
+        blob.upload_from_filename(file_path)
+
+
+@implementer(ISimpleStorage)
+class GCSSimpleStorage(GenericFileStorage):
     @classmethod
     @google.api_core.retry.Retry(
         predicate=google.api_core.retry.if_exception_type(
