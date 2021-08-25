@@ -89,6 +89,7 @@ class LocalSimpleStorage:
             with open(file_path, "rb") as src_fp:
                 dest_fp.write(src_fp.read())
 
+
 @implementer(IDocsStorage)
 class LocalDocsStorage:
     def __init__(self, base):
